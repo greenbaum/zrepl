@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"sort"
 
 	"github.com/kr/pretty"
 	"github.com/pkg/errors"
@@ -19,6 +20,7 @@ import (
 	"github.com/zrepl/zrepl/util/chainlock"
 	"github.com/zrepl/zrepl/util/envconst"
 	"github.com/zrepl/zrepl/util/nodefault"
+	"github.com/zrepl/zrepl/util/semaphore"
 	"github.com/zrepl/zrepl/zfs"
 	zfsprop "github.com/zrepl/zrepl/zfs/property"
 )
@@ -472,7 +474,18 @@ type ReceiverConfig struct {
 	OverrideProperties map[zfsprop.Property]string
 
 	BandwidthLimit bandwidthlimit.Config
+
+	PlaceholderEncryption PlaceholderCreationEncryptionProperty
 }
+
+//go:generate enumer -type=PlaceholderCreationEncryptionProperty -trimprefix=PlaceholderCreationEncryptionProperty
+type PlaceholderCreationEncryptionProperty int
+
+const (
+	PlaceholderCreationEncryptionPropertyUnspecified PlaceholderCreationEncryptionProperty = 1 << iota
+	PlaceholderCreationEncryptionPropertyInherit
+	PlaceholderCreationEncryptionPropertyOff
+)
 
 func (c *ReceiverConfig) copyIn() {
 	c.RootWithoutClientComponent = c.RootWithoutClientComponent.Copy()
@@ -511,6 +524,10 @@ func (c *ReceiverConfig) Validate() error {
 
 	if err := bandwidthlimit.ValidateConfig(c.BandwidthLimit); err != nil {
 		return errors.Wrap(err, "`BandwidthLimit` field invalid")
+	}
+
+	if !c.PlaceholderEncryption.IsAPlaceholderCreationEncryptionProperty() {
+		return errors.Errorf("`PlaceholderEncryption` field is invalid")
 	}
 
 	return nil
@@ -714,6 +731,97 @@ func (s *Receiver) SendDry(ctx context.Context, r *pdu.SendReq) (*pdu.SendRes, e
 	return nil, fmt.Errorf("receiver does not implement SendDry()")
 }
 
+var validatePlaceholderEncryptionPropZFSCommandsSem = semaphore.New(envconst.Int64("ZREPL_VALIDATE_PLACEHOLDER_ENCRYPTION_PROP_MAX_ZFS_COMMANDS", 24))
+
+type ValidatePlaceholderEncryptionPropReportPlaceholderInfo struct {
+	FS                 string
+	EncryptionProperty zfs.PropertyValue
+	Problem            error
+}
+
+type ValidatePlaceholderEncryptionPropReport struct {
+	NeedsAction          bool
+	UserMessage          string
+	AffectedPlaceholders []ValidatePlaceholderEncryptionPropReportPlaceholderInfo
+}
+
+// exported for use by platformtest
+func ValidatePlaceholderEncryptionPropImpl(ctx context.Context, root_fs string, placeholderEncryption PlaceholderCreationEncryptionProperty) (*ValidatePlaceholderEncryptionPropReport, error) {
+	defer trace.WithSpanFromStackUpdateCtx(&ctx)()
+
+	l := getLogger(ctx).
+		WithField("root_fs", root_fs)
+
+	l.WithField("placeholderEncryption", placeholderEncryption).Debug("start placeholder encryption property validation")
+
+	propsByFS, err := zfs.ZFSListPlaceholderFilesystemsWithAdditionalProps(ctx, root_fs, []string{"encryption", "encryptionroot"})
+	if err != nil {
+		return nil, err
+	}
+	if len(propsByFS) == 0 {
+		return &ValidatePlaceholderEncryptionPropReport{NeedsAction: false}, nil
+	}
+
+	var affectedPlaceholders []ValidatePlaceholderEncryptionPropReportPlaceholderInfo
+
+	switch placeholderEncryption {
+	case PlaceholderCreationEncryptionPropertyUnspecified:
+		// We checked for len(propsByFS) == 0 above.
+		// Hence, jobs that haven't created placeholders in the past won't reach this.
+		//
+		// And jobs that _did_ create placeholders before we introduced the
+		// requirement to explicitly specify the encryption behavior for placeholders
+		// will now be forced to do so.
+		return &ValidatePlaceholderEncryptionPropReport{
+			NeedsAction: true,
+			UserMessage: "specify placeholder encryption handling in the config",
+		}, nil
+	case PlaceholderCreationEncryptionPropertyOff:
+		for fs, props := range propsByFS {
+			p := props.GetDetails("encryption")
+			if p.Value != "off" { // checking p.Source == "local" doesn't apply to the 'encryption' property
+				affectedPlaceholders = append(affectedPlaceholders, ValidatePlaceholderEncryptionPropReportPlaceholderInfo{
+					FS:                 fs,
+					EncryptionProperty: p,
+					Problem:            errors.Errorf("should have encryption=off, found %#v", p),
+				})
+			}
+		}
+	case PlaceholderCreationEncryptionPropertyInherit:
+		for fs, props := range propsByFS {
+			fs = fs
+			props = props
+			// FIXME:
+			// encryption=off doesn't distinguish between source 'local' and 'default'; it's always 'default' (off) or '-' when it's on
+			// Hence, we can't use `source` to distinguish the following cases:
+			//   (1) placeholder created with explicit -o encryption=off
+			//   (2) placeholder created without specifying -o encryption
+			// ... with
+			//   (A) an encrypted parent at creation time
+			//   (B) an unencrypted parent at creation time
+			//
+			// => Find some other way to identify the case.
+			continue
+		}
+	default:
+		panic(placeholderEncryption)
+	}
+
+	sort.Slice(affectedPlaceholders, func(i, j int) bool {
+		return affectedPlaceholders[i].FS < affectedPlaceholders[j].FS
+	})
+
+	if len(affectedPlaceholders) > 0 {
+		return &ValidatePlaceholderEncryptionPropReport{
+			NeedsAction:          true,
+			UserMessage:          "re-create affected placeholder filesystems and check their childrens' encryption property",
+			AffectedPlaceholders: affectedPlaceholders,
+		}, nil
+	}
+
+	return &ValidatePlaceholderEncryptionPropReport{NeedsAction: false}, nil
+}
+
 func (s *Receiver) Receive(ctx context.Context, req *pdu.ReceiveReq, receive io.ReadCloser) (*pdu.ReceiveRes, error) {
 	defer trace.WithSpanFromStackUpdateCtx(&ctx)()
 
@@ -777,8 +885,29 @@ func (s *Receiver) Receive(ctx context.Context, req *pdu.ReceiveReq, receive io.
 					return false
 				}
 				l := getLogger(ctx).WithField("placeholder_fs", v.Path)
+
+				if !s.conf.PlaceholderEncryption.IsAPlaceholderCreationEncryptionProperty() {
+					panic(s.conf.PlaceholderEncryption)
+				}
+				var placeholderEncryption zfs.FilesystemPlaceholderCreateEncryptionValue
+				switch s.conf.PlaceholderEncryption {
+				case PlaceholderCreationEncryptionPropertyUnspecified:
+					visitErr = fmt.Errorf("placeholder encryption property behavior is unspecified in config")
+				case PlaceholderCreationEncryptionPropertyInherit:
+					placeholderEncryption = zfs.FilesystemPlaceholderCreateEncryptionInherit
+				case PlaceholderCreationEncryptionPropertyOff:
+					placeholderEncryption = zfs.FilesystemPlaceholderCreateEncryptionOff
+				default:
+					panic(s.conf.PlaceholderEncryption)
+				}
+				if visitErr != nil {
+					l.WithError(visitErr).Error("cannot create placeholder filesystem")
+					return false
+				}
+				l = l.WithField("encryption", placeholderEncryption)
+
 				l.Debug("create placeholder filesystem")
-				err := zfs.ZFSCreatePlaceholderFilesystem(ctx, v.Path, v.Parent.Path)
+				err := zfs.ZFSCreatePlaceholderFilesystem(ctx, v.Path, v.Parent.Path, placeholderEncryption)
 				if err != nil {
 					l.WithError(err).Error("cannot create placeholder filesystem")
 					visitErr = err
